@@ -11,6 +11,49 @@ const json = (data, status = 200) =>
     }
   });
 
+
+async function fetchWithRetry(input, init = {}, timeoutMs = 10000) {
+  let lastError;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(input, {
+        ...init,
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+
+      if (response.status < 500 || response.status > 599 || attempt === 2) {
+        return response;
+      }
+
+      try {
+        await response.body?.cancel();
+      } catch {}
+    } catch (error) {
+      lastError = error;
+      if (attempt === 2) throw error;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 120 * (attempt + 1)));
+  }
+
+  throw lastError || new Error("Fetch failed");
+}
+
+export function matchesSearchQuery(query, ...values) {
+  const normalize = value =>
+    String(value || "")
+      .normalize("NFKD")
+      .replace(/\p{M}/gu, "")
+      .toLowerCase();
+
+  const tokens = normalize(query).match(/[\p{L}\p{N}]+/gu) || [];
+  const haystack = normalize(values.filter(Boolean).join(" "));
+  const words = new Set(haystack.match(/[\p{L}\p{N}]+/gu) || []);
+
+  return tokens.length > 0 && tokens.every(token => words.has(token));
+}
+
 export function encodeTrackId(identifier, filename) {
   const data = JSON.stringify({ identifier, filename });
   const bytes = new TextEncoder().encode(data);
@@ -123,10 +166,12 @@ function archiveUrl(identifier, filename) {
 }
 
 async function metadata(identifier) {
-  const r = await fetch(
+  const r = await fetchWithRetry(
     "https://archive.org/metadata/" + encodeURIComponent(identifier),
-    { signal: AbortSignal.timeout(10000) }
+    {},
+    10000
   );
+
   if (!r.ok) return null;
   return r.json();
 }
@@ -166,11 +211,10 @@ export async function inspect(url) {
   let reader;
 
   try {
-    const r = await fetch(url, {
+    const r = await fetchWithRetry(url, {
       headers: { Range: "bytes=0-63" },
-      redirect: "follow",
-      signal: AbortSignal.timeout(8000)
-    });
+      redirect: "follow"
+    }, 8000);
 
     if (r.status !== 206) {
       await r.body?.cancel();
@@ -264,25 +308,34 @@ export function normalizeQuality(value) {
 
 async function search(query, quality) {
   if (quality === "low" || quality === "high") return [];
+
+  const phrase = query
+    .replace(/["\\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
   const params = new URLSearchParams({
-    q: `mediatype:audio AND (${query})`,
+    q: `mediatype:audio AND (title:"${phrase}" OR creator:"${phrase}")`,
     fl: "identifier,title,creator,year",
-    rows: "10",
+    rows: "50",
     output: "json"
   });
 
-  const r = await fetch(
+  const r = await fetchWithRetry(
     "https://archive.org/advancedsearch.php?" + params,
-    { signal: AbortSignal.timeout(10000) }
+    {},
+    10000
   );
+
   if (!r.ok) throw new Error("Internet Archive search failed");
 
   const result = await r.json();
   const docs = result?.response?.docs || [];
   const tracks = [];
 
-  for (const doc of docs.slice(0, 8)) {
+  for (const doc of docs.slice(0, 30)) {
     if (!doc.identifier) continue;
+    if (!matchesSearchQuery(query, doc.title, doc.creator)) continue;
 
     const item = await metadata(doc.identifier);
     if (!item || item.is_dark) continue;
@@ -293,6 +346,17 @@ async function search(query, quality) {
     );
 
     for (const file of files.slice(0, 3)) {
+      if (!matchesSearchQuery(
+        query,
+        doc.title,
+        doc.creator,
+        item.metadata?.title,
+        item.metadata?.creator,
+        file.title,
+        file.creator,
+        file.name
+      )) continue;
+
       const url = archiveUrl(doc.identifier, file.name);
       const info = await inspect(url);
 
@@ -322,6 +386,7 @@ async function search(query, quality) {
 
   return tracks;
 }
+
 
 async function streamInternal(id, quality = "hires") {
   quality = normalizeQuality(quality);

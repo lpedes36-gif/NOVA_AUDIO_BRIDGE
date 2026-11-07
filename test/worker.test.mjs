@@ -6,7 +6,8 @@ import worker, {
   parseFlacStreamInfo,
   inspect,
   normalizeQuality,
-  buildTrackMetadata
+  buildTrackMetadata,
+  matchesSearchQuery
 } from "../src/index.js";
 
 test("Track ID encode/decode", () => {
@@ -371,3 +372,50 @@ test("Omit unavailable or invalid track duration", () => {
     album: "Album"
   });
 });
+
+
+test("Retry transient HTTP 503 during FLAC inspection", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+
+  try {
+    globalThis.fetch = async () => {
+      calls++;
+
+      if (calls === 1) {
+        return new Response("temporary error", { status: 503 });
+      }
+
+      return new Response(makeFlacHeader(), {
+        status: 206,
+        headers: { "content-range": "bytes 0-41/100" }
+      });
+    };
+
+    const result = await inspect("https://example.test/audio.flac");
+
+    assert.equal(calls, 2);
+    assert.equal(result.format, "FLAC");
+    assert.equal(result.sampleRate, 96000);
+    assert.equal(result.bitDepth, 24);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Search relevance accepts matching artist and rejects unrelated podcast", () => {
+  assert.equal(
+    matchesSearchQuery("daft punk", "Derezzed", "Daft Punk"),
+    true
+  );
+
+  assert.equal(
+    matchesSearchQuery(
+      "daft punk",
+      "LW PODCAST EP02 2016",
+      "Veteran Voices of Pittsburgh"
+    ),
+    false
+  );
+});
+
