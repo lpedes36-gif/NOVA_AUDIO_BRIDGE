@@ -487,6 +487,7 @@ export default {
         id: "id.nova.audio.bridge",
         name: APP,
         version: VERSION,
+        bitchordAuth: true,
         description: "Internet Archive FLAC discovery bridge",
         resources: ["search", "stream"],
         types: ["track"],
